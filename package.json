@@ -1,0 +1,11 @@
+{
+  "name": "your-app",
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "start": "node all.mjs"
+  },
+  "dependencies": {
+    "express": "^4.19.2"
+  }
+}
