@@ -5,6 +5,7 @@ import Imap from "imap";
 import { simpleParser } from "mailparser";
 import nodemailer from "nodemailer";
 import axios from "axios";
+import express from "express";
 import { execFile } from "child_process";
 import { promisify } from "util";
 import * as fs from "fs";
@@ -12,12 +13,6 @@ import * as path from "path";
 import { fileURLToPath } from "url";
 import crypto from "crypto";
 import limit from "p-limit";
-import express from "express";
-const app = express();
-
-// This is the endpoint Cloudflare Worker will call
-app.get("/run", async (req, res) => {
-  console.log("Triggered at", new Date());
 
 const execFileAsync = promisify(execFile);
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -33,6 +28,9 @@ const EMAIL_SIZE_LIMIT = 25 * 1024 * 1024;
 
 // Check interval (1 minute)
 const CHECK_INTERVAL = 60000;
+const AUTO_CHECK_INTERVAL_MS = Math.max(parseInt(process.env.AUTO_CHECK_INTERVAL_MS || "0", 10), 0);
+const PORT = parseInt(process.env.PORT || "3000", 10);
+const TRIGGER_SECRET = process.env.TRIGGER_SECRET || "";
 
 // Concurrent download limit
 const CONCURRENT_DOWNLOADS = 3;
@@ -46,6 +44,8 @@ const TEMP_DIR = path.join(__dirname, ".temp");
 let isProcessing = false;
 let imapConnected = false;
 let tempFilesCreated = [];
+let lastTriggerStartedAt = null;
+let lastTriggerCompletedAt = null;
 
 // User agents for rotation
 const USER_AGENTS = [
@@ -126,6 +126,37 @@ function cleanupTempFiles() {
   } catch (error) {
     // Directory not empty or other error - that's ok
   }
+}
+
+function buildStatusPayload() {
+  return {
+    ok: true,
+    imapConnected,
+    isProcessing,
+    autoCheckIntervalMs: AUTO_CHECK_INTERVAL_MS,
+    lastTriggerStartedAt,
+    lastTriggerCompletedAt,
+    uptimeSeconds: Math.round(process.uptime())
+  };
+}
+
+function isAuthorizedTrigger(req) {
+  if (!TRIGGER_SECRET) {
+    return true;
+  }
+
+  const authHeader = req.headers.authorization || "";
+  const bearerToken = authHeader.startsWith("Bearer ")
+    ? authHeader.slice("Bearer ".length)
+    : "";
+  const queryToken = typeof req.query.secret === "string" ? req.query.secret : "";
+  const headerToken = typeof req.headers["x-trigger-secret"] === "string"
+    ? req.headers["x-trigger-secret"]
+    : "";
+
+  return bearerToken === TRIGGER_SECRET
+    || queryToken === TRIGGER_SECRET
+    || headerToken === TRIGGER_SECRET;
 }
 
 // ==================== TRACKING FUNCTIONS ====================
@@ -1055,19 +1086,24 @@ async function sendEmailsWithAttachments(subreddit, allAttachments) {
 
 async function processRedditLabel() {
   if (isProcessing) {
-    console.log(`[${new Date().toLocaleTimeString()}] ⏳ Check already in progress, skipping...`);
-    return;
+    console.log(`[${new Date().toLocaleTimeString()}] Check already in progress, skipping...`);
+    return { started: false, reason: "already_processing" };
   }
 
   isProcessing = true;
+  lastTriggerStartedAt = new Date().toISOString();
   const timestamp = new Date().toLocaleTimeString();
-  console.log(`\n[${timestamp}] 🔍 Starting Reddit label check...`);
+  console.log(`\n[${timestamp}] Starting Reddit label check...`);
 
   try {
     await checkRedditLabel();
-    console.log(`[${new Date().toLocaleTimeString()}] ✓ Reddit label check completed`);
+    console.log(`[${new Date().toLocaleTimeString()}] Reddit label check completed`);
+    lastTriggerCompletedAt = new Date().toISOString();
+    return { started: true, completed: true };
   } catch (error) {
-    console.error(`[${new Date().toLocaleTimeString()}] ✗ Error during check:`, error.message);
+    console.error(`[${new Date().toLocaleTimeString()}] Error during check:`, error.message);
+    lastTriggerCompletedAt = new Date().toISOString();
+    return { started: true, completed: false, error: error.message };
   } finally {
     isProcessing = false;
   }
@@ -1080,6 +1116,51 @@ function startAutomatedChecks() {
   processRedditLabel();
 
   setInterval(processRedditLabel, CHECK_INTERVAL);
+}
+
+function startHttpServer() {
+  const app = express();
+
+  app.get("/", (_req, res) => {
+    res.json({
+      service: "reddit-media-downloader",
+      ...buildStatusPayload()
+    });
+  });
+
+  app.get("/health", (_req, res) => {
+    res.json(buildStatusPayload());
+  });
+
+  app.get("/trigger", async (req, res) => {
+    if (!isAuthorizedTrigger(req)) {
+      res.status(401).json({ ok: false, error: "unauthorized" });
+      return;
+    }
+
+    if (!imapConnected) {
+      res.status(503).json({
+        ok: false,
+        error: "imap_not_connected",
+        message: "IMAP is not connected yet"
+      });
+      return;
+    }
+
+    await processRedditLabel();
+
+    res.json({
+      ok: true,
+      message: isProcessing ? "trigger_accepted_or_running" : "trigger_completed",
+      status: buildStatusPayload()
+    });
+  });
+
+  app.listen(PORT, () => {
+    console.log(`HTTP trigger server listening on port ${PORT}`);
+    console.log("Health URL: /health");
+    console.log("Trigger URL: /trigger");
+  });
 }
 
 // ==================== MAIN ====================
@@ -1099,12 +1180,19 @@ async function main() {
 
   console.log(`Starting Reddit Media Downloader for ${GMAIL_USER}`);
   console.log("=========================================");
+  startHttpServer();
 
   return new Promise((resolve, reject) => {
     imap.on("ready", () => {
       imapConnected = true;
       console.log("✓ IMAP connected\n");
-      startAutomatedChecks();
+      if (AUTO_CHECK_INTERVAL_MS > 0) {
+        console.log(`Automatic polling enabled every ${AUTO_CHECK_INTERVAL_MS / 1000} seconds`);
+        processRedditLabel();
+        setInterval(processRedditLabel, AUTO_CHECK_INTERVAL_MS);
+      } else {
+        console.log("Automatic polling disabled; use the HTTP trigger endpoint to run checks");
+      }
     });
 
     imap.on("error", (err) => {
@@ -1145,7 +1233,4 @@ main()
     console.error("✗ Fatal error:", err.message);
     process.exit(1);
   });
-});
 
-// Start the server
-app.listen(3000, () => console.log("Server running on port 3000"));
